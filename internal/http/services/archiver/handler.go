@@ -44,13 +44,11 @@ import (
 	"github.com/gdexlab/go-render/render"
 	ua "github.com/mileusna/useragent"
 	"github.com/mitchellh/mapstructure"
-	"github.com/rs/zerolog"
 )
 
 type svc struct {
 	config     *Config
 	gtwClient  gateway.GatewayAPIClient
-	log        *zerolog.Logger
 	walker     walker.Walker
 	downloader downloader.Downloader
 
@@ -74,7 +72,7 @@ func init() {
 }
 
 // New creates a new archiver service.
-func New(conf map[string]interface{}, log *zerolog.Logger) (global.Service, error) {
+func New(ctx context.Context, conf map[string]interface{}) (global.Service, error) {
 	c := &Config{}
 	err := mapstructure.Decode(conf, c)
 	if err != nil {
@@ -103,7 +101,6 @@ func New(conf map[string]interface{}, log *zerolog.Logger) (global.Service, erro
 		gtwClient:      gtw,
 		downloader:     downloader.NewDownloader(gtw, rhttp.Insecure(c.Insecure), rhttp.Timeout(time.Duration(c.Timeout*int64(time.Second)))),
 		walker:         walker.NewWalker(gtw),
-		log:            log,
 		allowedFolders: allowedFolderRegex,
 	}, nil
 }
@@ -188,21 +185,22 @@ func (s *svc) allAllowed(paths []string) error {
 	return nil
 }
 
-func (s *svc) writeHTTPError(rw http.ResponseWriter, err error) {
-	s.log.Error().Msg(err.Error())
+func (s *svc) writeHTTPError(ctx context.Context, w http.ResponseWriter, err error) {
+	log := appctx.GetLogger(ctx)
+	log.Error().Msg(err.Error())
 
 	switch err.(type) {
 	case errtypes.NotFound:
-		rw.WriteHeader(http.StatusNotFound)
+		w.WriteHeader(http.StatusNotFound)
 	case manager.ErrMaxSize, manager.ErrMaxFileCount:
-		rw.WriteHeader(http.StatusRequestEntityTooLarge)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
 	case errtypes.BadRequest:
-		rw.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
 	default:
-		rw.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
 	}
 
-	_, _ = rw.Write([]byte(err.Error()))
+	_, _ = w.Write([]byte(err.Error()))
 }
 
 func (s *svc) Handler() http.Handler {
@@ -223,7 +221,7 @@ func (s *svc) Handler() http.Handler {
 
 		files, err := s.getFiles(ctx, paths, ids)
 		if err != nil {
-			s.writeHTTPError(rw, err)
+			s.writeHTTPError(ctx, rw, err)
 			return
 		}
 
@@ -232,7 +230,7 @@ func (s *svc) Handler() http.Handler {
 			MaxSize:     s.config.MaxSize,
 		})
 		if err != nil {
-			s.writeHTTPError(rw, err)
+			s.writeHTTPError(ctx, rw, err)
 			return
 		}
 
@@ -268,7 +266,7 @@ func (s *svc) Handler() http.Handler {
 		}
 
 		if err != nil {
-			s.writeHTTPError(rw, err)
+			s.writeHTTPError(ctx, rw, err)
 			return
 		}
 	})
