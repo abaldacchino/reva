@@ -20,7 +20,10 @@ package overleafimport
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"time"
 
 	appprovider "github.com/cs3org/go-cs3apis/cs3/app/provider/v1beta1"
@@ -29,6 +32,7 @@ import (
 	typespb "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
 	"github.com/cs3org/reva/pkg/app"
 	"github.com/cs3org/reva/pkg/app/provider/registry"
+	"github.com/cs3org/reva/pkg/appctx"
 	"github.com/cs3org/reva/pkg/rgrpc/todo/pool"
 	"github.com/cs3org/reva/pkg/rhttp"
 	"github.com/cs3org/reva/pkg/sharedconf"
@@ -42,7 +46,7 @@ type overleafImportProvider struct {
 }
 
 func (p *overleafImportProvider) GetAppURL(ctx context.Context, resource *provider.ResourceInfo, viewMode appprovider.ViewMode, token string, opaqueMap map[string]*typespb.OpaqueEntry, language string) (*appprovider.OpenInAppURL, error) {
-	// log := appctx.GetLogger(ctx)
+	log := appctx.GetLogger(ctx)
 
 	client, err := pool.GetGatewayServiceClient(pool.Endpoint(sharedconf.GetGatewaySVC("")))
 	if err != nil {
@@ -67,6 +71,43 @@ func (p *overleafImportProvider) GetAppURL(ctx context.Context, resource *provid
 	// if !found {
 	// 	return nil, errors.New("overleaf import: error getting file export name")
 	// }
+
+	projectid := "64ccc49c7c0120f8f88ab4f4"
+
+	downloadUrl, err := url.Parse(p.conf.AppURL)
+
+	if err != nil {
+		return nil, errors.Wrap(err, "overleaf import: error parsing app provider url")
+	}
+
+	downloadUrl.Path = path.Join(downloadUrl.Path, "/project/", projectid, "/download/zip")
+
+	httpReq, err := rhttp.NewRequest(ctx, http.MethodGet, downloadUrl.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	q := httpReq.URL.Query()
+	httpReq.URL.RawQuery = q.Encode()
+
+	httpReq.Header.Set("Cookie", p.conf.Cookie)
+	httpReq.Header.Set("Host", "www.overleaf.com")
+
+	log.Debug().Str("url", httpReq.URL.String()).Msg("Sending request to Overleaf server")
+	openRes, err := p.overleafClient.Do(httpReq)
+	if err != nil {
+		return nil, errors.Wrap(err, "overleaf import: error performing open request to Overleaf server")
+	}
+	defer openRes.Body.Close()
+
+	_, err = io.ReadAll(openRes.Body)
+	if err != nil {
+		return nil, err
+	}
+	if openRes.StatusCode != http.StatusOK {
+		// Overleaf server returned failure
+		return nil, errors.New("overleaf import: failed to make request to Overleaf server")
+	}
 
 	return &appprovider.OpenInAppURL{
 		AppUrl: "",
