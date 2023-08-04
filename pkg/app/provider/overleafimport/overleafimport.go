@@ -126,7 +126,7 @@ func (p *overleafImportProvider) GetAppProviderInfo(ctx context.Context) (*appre
 }
 
 func init() {
-	registry.Register("overleaf", New)
+	registry.Register("overleafimport", New)
 }
 
 type config struct {
