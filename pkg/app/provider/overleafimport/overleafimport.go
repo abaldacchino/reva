@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
 	"time"
 
 	appprovider "github.com/cs3org/go-cs3apis/cs3/app/provider/v1beta1"
@@ -67,12 +68,48 @@ func (p *overleafImportProvider) GetAppURL(ctx context.Context, resource *provid
 	if !found {
 		return nil, errors.New("overleaf import: file not previously exported, error getting file export time")
 	}
-	// name, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.name"]
-	// if !found {
-	// 	return nil, errors.New("overleaf import: error getting file export name")
-	// }
+	name, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.name"]
+	if !found {
+		return nil, errors.New("overleaf import: error getting file export name")
+	}
 
-	projectid := "64ccc49c7c0120f8f88ab4f4"
+	projectid, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.projectid"]
+
+	// If not found we try to resolve using export time and project name
+	if !found {
+		projectUrl, err := url.Parse(p.conf.AppURL)
+
+		if err != nil {
+			return nil, errors.Wrap(err, "overleaf import: error parsing app provider url")
+		}
+
+		projectUrl.Path = path.Join(projectUrl.Path, "/project")
+
+		httpReq, err := rhttp.NewRequest(ctx, http.MethodGet, projectUrl.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+
+		log.Debug().Str("get projects url", httpReq.URL.String()).Msg("Sending project request to Overleaf server")
+		getProjectsRes, err := p.overleafClient.Do(httpReq)
+		if err != nil {
+			return nil, errors.Wrap(err, "overleaf import: error performing project request to Overleaf server")
+		}
+		defer getProjectsRes.Body.Close()
+
+		body, err := io.ReadAll(getProjectsRes.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		sbody := string(body)
+		// Restrict text to contain the information of our project onwards
+		restrictedText := sbody[strings.Index(sbody, "&quot;"+name+"&quot;"):]
+		// Restrict text to start at project id
+		restrictedText = restrictedText[strings.Index(restrictedText, "&quot;id&quot;:&quot;")+len("&quot;id&quot;:&quot;"):]
+		// Finding end of project id
+		projectid = restrictedText[:strings.Index(restrictedText, "&quot")]
+	}
 
 	downloadUrl, err := url.Parse(p.conf.AppURL)
 
@@ -94,23 +131,23 @@ func (p *overleafImportProvider) GetAppURL(ctx context.Context, resource *provid
 	httpReq.Header.Set("Host", "www.overleaf.com")
 
 	log.Debug().Str("url", httpReq.URL.String()).Msg("Sending request to Overleaf server")
-	openRes, err := p.overleafClient.Do(httpReq)
+	downloadRes, err := p.overleafClient.Do(httpReq)
 	if err != nil {
 		return nil, errors.Wrap(err, "overleaf import: error performing open request to Overleaf server")
 	}
-	defer openRes.Body.Close()
+	defer downloadRes.Body.Close()
 
-	_, err = io.ReadAll(openRes.Body)
+	_, err = io.ReadAll(downloadRes.Body)
 	if err != nil {
 		return nil, err
 	}
-	if openRes.StatusCode != http.StatusOK {
+	if downloadRes.StatusCode != http.StatusOK {
 		// Overleaf server returned failure
 		return nil, errors.New("overleaf import: failed to make request to Overleaf server")
 	}
 
 	return &appprovider.OpenInAppURL{
-		AppUrl: "",
+		AppUrl: "https://www.overleaf.com",
 		Method: http.MethodGet,
 		Target: appprovider.Target_TARGET_BLANK,
 	}, nil
