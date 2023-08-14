@@ -19,7 +19,11 @@
 package overleaf
 
 import (
+<<<<<<< HEAD
 	"context"
+=======
+	"encoding/base64"
+>>>>>>> 05c6bbb3b (Base encoding project name to avoid problem with spaces)
 	"encoding/json"
 	"io"
 	"net/http"
@@ -494,7 +498,7 @@ func (s *svc) handleExport(w http.ResponseWriter, r *http.Request) {
 		ArbitraryMetadata: &provider.ArbitraryMetadata{
 			Metadata: map[string]string{
 				"reva.overleaf.exporttime": strconv.Itoa(int(time.Now().Unix())),
-				"reva.overleaf.name":       name,
+				"reva.overleaf.name":       base64.StdEncoding.EncodeToString([]byte(name)),
 			},
 		},
 	}
