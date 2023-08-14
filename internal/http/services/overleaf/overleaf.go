@@ -21,8 +21,12 @@ package overleaf
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -41,14 +45,14 @@ import (
 	"github.com/cs3org/reva/pkg/utils/resourceid"
 	"github.com/go-chi/chi/v5"
 	"github.com/mitchellh/mapstructure"
-	"github.com/rs/zerolog"
+	"github.com/pkg/errors"
 )
 
 type svc struct {
-	conf      *config
-	gtwClient gateway.GatewayAPIClient
-	log       *zerolog.Logger
-	router    *chi.Mux
+	conf       *config
+	gtwClient  gateway.GatewayAPIClient
+	httpClient *http.Client
+	router     *chi.Mux
 }
 
 type config struct {
@@ -58,6 +62,7 @@ type config struct {
 	ArchiverURL string `mapstructure:"archiver_url" docs:";Internet-facing URL of the archiver service, used to serve the files to Overleaf."`
 	AppURL      string `mapstructure:"app_url" docs:";The App URL."`
 	Insecure    bool   `mapstructure:"insecure" docs:"false;Whether to skip certificate checks when sending requests."`
+	Cookie      string `mapstructure:"cookie" docs:"Stores user cookie to access files as a temporary workaround"`
 }
 
 func init() {
@@ -77,12 +82,22 @@ func New(ctx context.Context, m map[string]interface{}) (global.Service, error) 
 		return nil, err
 	}
 
+	// Need http client to make requests to Overleaf server
+	httpClient := rhttp.GetHTTPClient(
+		rhttp.Timeout(time.Duration(10*int64(time.Second))),
+		rhttp.Insecure(conf.Insecure),
+	)
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
 	r := chi.NewRouter()
 
 	s := &svc{
-		conf:      conf,
-		gtwClient: gtw,
-		router:    r,
+		conf:       conf,
+		gtwClient:  gtw,
+		httpClient: httpClient,
+		router:     r,
 	}
 
 	if err := s.routerInit(); err != nil {
@@ -126,7 +141,234 @@ func (s *svc) Handler() http.Handler {
 }
 
 func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
-	reqres.WriteError(w, r, reqres.APIErrorUnimplemented, "Overleaf import not yet supported", nil)
+	ctx := r.Context()
+	log := appctx.GetLogger(ctx)
+
+	if err := r.ParseForm(); err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "parameters could not be parsed", nil)
+		return
+	}
+
+	resourceID := r.Form.Get("resource_id")
+
+	var resourceRef storagepb.Reference
+	if resourceID == "" {
+		path := r.Form.Get("path")
+		if path == "" {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "missing resource ID or path", nil)
+			return
+		}
+		resourceRef.Path = path
+	} else {
+		resourceID := resourceid.OwnCloudResourceIDUnwrap(resourceID)
+		if resourceID == nil {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "invalid resource ID", nil)
+			return
+		}
+		resourceRef.ResourceId = resourceID
+	}
+
+	statRes, err := s.gtwClient.Stat(ctx, &storagepb.StatRequest{Ref: &resourceRef})
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "Internal error accessing the resource, please try again later", err)
+		return
+	}
+
+	if statRes.Status.Code == rpc.Code_CODE_NOT_FOUND {
+		reqres.WriteError(w, r, reqres.APIErrorNotFound, "resource does not exist", nil)
+		return
+	} else if statRes.Status.Code != rpc.Code_CODE_OK {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to stat the resource", nil)
+		return
+	}
+
+	resource := statRes.Info
+
+	// User needs to have edit rights to import from Overleaf
+	if !resource.PermissionSet.InitiateFileUpload || !resource.PermissionSet.InitiateFileDownload {
+		reqres.WriteError(w, r, reqres.APIErrorUnauthenticated, "permission denied when accessing the file", err)
+		return
+	}
+
+	if resource.Type != storagepb.ResourceType_RESOURCE_TYPE_FILE && resource.Type != storagepb.ResourceType_RESOURCE_TYPE_CONTAINER {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "invalid resource type, resource should be a file or a folder", nil)
+		return
+	}
+
+	token, ok := ctxpkg.ContextGetToken(ctx)
+	if !ok || token == "" {
+		reqres.WriteError(w, r, reqres.APIErrorUnauthenticated, "Access token is invalid or empty", err)
+		return
+	}
+
+	exportTimeStr, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.exporttime"]
+	if !found {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: file not previously exported, error getting file export time", nil)
+		return
+	}
+	exportTime, err := strconv.Atoi(exportTimeStr)
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: exportTime not in the correct format", nil)
+		return
+	}
+
+	name, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.name"]
+	if !found {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: error getting file export name", nil)
+		return
+	}
+
+	log.Debug().Str("project name", name).Msg("Name of project as saved in external attribute")
+
+	projectId, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.projectid"]
+
+	// If not found we try to resolve using export time and project name
+	// Once Overleaf access is given, this can becomes redundant as we would be able to find the project id during export
+	if !found {
+		projectUrl, err := url.Parse(s.conf.AppURL)
+
+		if err != nil {
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error parsing app provider url", err)
+			return
+		}
+
+		projectUrl.Path = path.Join(projectUrl.Path, "/project")
+
+		httpReq, err := rhttp.NewRequest(ctx, http.MethodGet, projectUrl.String(), nil)
+		if err != nil {
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: making http request", err)
+			return
+		}
+		httpReq.Header.Set("Cookie", s.conf.Cookie)
+		httpReq.Header.Set("Host", "www.overleaf.com")
+		log.Debug().Str("cookie", s.conf.Cookie).Msg("Overleaf cookie being sent")
+
+		log.Debug().Str("get projects url", httpReq.URL.String()).Msg("Sending project request to Overleaf server")
+		getProjectsRes, err := s.httpClient.Do(httpReq)
+		if err != nil {
+			log.Err(err).Msg("overleaf import: error performing project request to Overleaf server")
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error performing project request to Overleaf server", err)
+			return
+		}
+		defer getProjectsRes.Body.Close()
+
+		if getProjectsRes.StatusCode != http.StatusOK {
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: Overleaf server returned an error", err)
+			return
+		}
+
+		body, err := io.ReadAll(getProjectsRes.Body)
+		if err != nil {
+			log.Err(err).Msg("overleaf import: error reading body")
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error reading body", err)
+			return
+		}
+		sbody := string(body)
+
+		// Name might be in form <name> (<number>) after being exported to Overleaf, due to name conflicts
+		expr := regexp.MustCompile("&quot;" + name + "( \\(([0-9]+)\\))?" + "&quot;")
+		indices := expr.FindAllStringIndex(sbody, -1)
+
+		if indices == nil {
+			reqres.WriteError(w, r, reqres.APIErrorNotFound, "overleaf import: no matching project found", err)
+			return
+		}
+
+		// Distance is the time between export in CERNBox and project creation in Overleaf
+		// To ensure a project match, we enforce that project creation can happen up to 30 seconds after export in CERNBox.
+		distance := 30001
+
+		for _, index := range indices {
+			restrictedText := sbody[:index[0]]
+			// Restrict text to start at project id value beginning
+			restrictedText = restrictedText[strings.LastIndex(restrictedText, "&quot;id&quot;:&quot;")+len("&quot;id&quot;:&quot;"):]
+			newProjectId := restrictedText[:strings.Index(restrictedText, "&quot")]
+
+			projectExportTime, err := s.getProjectCreationTime(ctx, newProjectId)
+			if err != nil {
+				reqres.WriteError(w, r, reqres.APIErrorNotFound, "overleaf import: unable to find project creation time", err)
+				return
+			}
+
+			// Picking project closest to export time
+			newDistance := (projectExportTime / 1000) - exportTime
+			if newDistance >= 0 && // Project exported at or after export time
+				newDistance < distance {
+				distance = newDistance
+				projectId = newProjectId
+			}
+		}
+
+		// If distance unchanged, no matching project was found
+		if distance == 30001 {
+			reqres.WriteError(w, r, reqres.APIErrorNotFound, "overleaf import: no matching project found based on export time", err)
+			return
+		}
+
+		// Otherwise store project id for sync later
+		req := &provider.SetArbitraryMetadataRequest{
+			Ref: &provider.Reference{
+				ResourceId: resource.Id,
+			},
+			ArbitraryMetadata: &provider.ArbitraryMetadata{
+				Metadata: map[string]string{
+					"reva.overleaf.projectid": projectId,
+				},
+			},
+		}
+
+		res, err := s.gtwClient.SetArbitraryMetadata(ctx, req)
+
+		if err != nil {
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error setting arbitrary metadata", nil)
+			return
+		}
+		if res.Status.Code != rpc.Code_CODE_OK {
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error statting", nil)
+			return
+		}
+	}
+
+	downloadUrl, err := url.Parse(s.conf.AppURL)
+
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error parsing app provider url", err)
+		return
+	}
+
+	downloadUrl.Path = path.Join(downloadUrl.Path, "/project/", projectId, "/download/zip")
+
+	httpReq, err := rhttp.NewRequest(ctx, http.MethodGet, downloadUrl.String(), nil)
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error creating http request", err)
+		return
+	}
+
+	httpReq.Header.Set("Cookie", s.conf.Cookie)
+	httpReq.Header.Set("Host", "www.overleaf.com")
+
+	log.Debug().Str("url", httpReq.URL.String()).Msg("Sending request to Overleaf server")
+	downloadRes, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error performing open request to Overleaf server", err)
+		return
+	}
+	defer downloadRes.Body.Close()
+
+	_, err = io.ReadAll(downloadRes.Body)
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error reading Overleaf response", err)
+		return
+	}
+	if downloadRes.StatusCode != http.StatusOK {
+		// Overleaf server returned failure
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: failed to make request to Overleaf server", err)
+		return
+	}
+
+	// No need to return anything, so content is empty here.
+	w.Header().Set("Content-Length", "0")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *svc) handleExport(w http.ResponseWriter, r *http.Request) {
@@ -278,4 +520,69 @@ func (s *svc) handleExport(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *svc) getProjectCreationTime(ctx context.Context, projectId string) (int, error) {
+	log := appctx.GetLogger(ctx)
+
+	nextBeforeTimestamp := 0
+
+	// Need to loop since Overleaf does not expose all updates at a time
+	for {
+		getUpdatesUrl, err := url.Parse(s.conf.AppURL)
+
+		if err != nil {
+			return -1, errors.Wrap(err, "overleaf import: error parsing app provider url")
+		}
+
+		getUpdatesUrl.Path = path.Join(getUpdatesUrl.Path, "/project/", projectId, "/updates")
+
+		httpReq, err := rhttp.NewRequest(ctx, http.MethodGet, getUpdatesUrl.String(), nil)
+		if err != nil {
+			return -1, errors.Wrap(err, "overleaf import: unable to create new http request")
+		}
+
+		q := httpReq.URL.Query()
+		q.Add("min_count", "10")
+		if nextBeforeTimestamp != 0 {
+			q.Add("before", strconv.Itoa(nextBeforeTimestamp))
+		}
+
+		httpReq.URL.RawQuery = q.Encode()
+
+		httpReq.Header.Set("Cookie", s.conf.Cookie)
+		httpReq.Header.Set("Host", "www.overleaf.com")
+
+		getUpdatesRes, err := s.httpClient.Do(httpReq)
+		if err != nil {
+			log.Err(err).Msg("overleaf import: error performing project request to Overleaf server")
+			return -1, errors.Wrap(err, "overleaf import: error performing project request to Overleaf server")
+		}
+		defer getUpdatesRes.Body.Close()
+
+		body, err := io.ReadAll(getUpdatesRes.Body)
+
+		var result map[string]interface{}
+		err = json.Unmarshal(body, &result)
+		if err != nil {
+			return -1, err
+		}
+
+		nextBeforeTimestampInterface, remainingUpdates := result["nextBeforeTimeStamp"]
+		if remainingUpdates {
+			nextBeforeTimestamp = nextBeforeTimestampInterface.(int)
+		} else {
+			updatesInterface, ok := result["updates"]
+			if !ok {
+				return -1, errors.Wrap(err, "overleaf import: unable to get updates field from Overleaf response")
+			}
+
+			updates := updatesInterface.([]interface{})
+			lastUpdateInterface := updates[len(updates)-1]
+			lastUpdate := lastUpdateInterface.(map[string]interface{})
+			metaData := lastUpdate["meta"].(map[string]interface{})
+			time := int(metaData["start_ts"].(float64))
+			return time, nil
+		}
+	}
 }
