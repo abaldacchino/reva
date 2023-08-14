@@ -19,11 +19,8 @@
 package overleaf
 
 import (
-<<<<<<< HEAD
 	"context"
-=======
 	"encoding/base64"
->>>>>>> 05c6bbb3b (Base encoding project name to avoid problem with spaces)
 	"encoding/json"
 	"io"
 	"net/http"
@@ -216,13 +213,18 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.name"]
+	encodedName, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.name"]
+	decodedName, err := base64.StdEncoding.DecodeString(encodedName)
+	name := string(decodedName)
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: error decoding project name", nil)
+		return
+	}
+
 	if !found {
 		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: error getting file export name", nil)
 		return
 	}
-
-	log.Debug().Str("project name", name).Msg("Name of project as saved in external attribute")
 
 	projectId, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.projectid"]
 
