@@ -202,35 +202,36 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	exportTimeStr, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.exporttime"]
-	if !found {
-		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: file not previously exported, error getting file export time", nil)
-		return
-	}
-	exportTime, err := strconv.Atoi(exportTimeStr)
-	if err != nil {
-		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: exportTime not in the correct format", nil)
-		return
-	}
-
-	encodedName, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.name"]
-	decodedName, err := base64.StdEncoding.DecodeString(encodedName)
-	name := string(decodedName)
-	if err != nil {
-		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: error decoding project name", nil)
-		return
-	}
-
-	if !found {
-		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: error getting file export name", nil)
-		return
-	}
-
 	projectId, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.projectid"]
 
 	// If not found we try to resolve using export time and project name
 	// Once Overleaf access is given, this can becomes redundant as we would be able to find the project id during export
 	if !found {
+		// Get name and export time in order to match with existing projects
+		exportTimeStr, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.exporttime"]
+		if !found {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: file not previously exported, error getting file export time", nil)
+			return
+		}
+		exportTime, err := strconv.Atoi(exportTimeStr)
+		if err != nil {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: exportTime not in the correct format", nil)
+			return
+		}
+
+		encodedName, found := statRes.Info.GetArbitraryMetadata().Metadata["reva.overleaf.name"]
+		if !found {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: error getting file export name", nil)
+			return
+		}
+		decodedName, err := base64.StdEncoding.DecodeString(encodedName)
+		if err != nil {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "overleaf import: error decoding project name", nil)
+			return
+		}
+		name := string(decodedName)
+
+		// Making request to get project list
 		projectUrl, err := url.Parse(s.conf.AppURL)
 
 		if err != nil {
@@ -272,7 +273,14 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 		sbody := string(body)
 
 		// Name might be in form <name> (<number>) after being exported to Overleaf, due to name conflicts
-		expr := regexp.MustCompile("&quot;" + name + "( \\(([0-9]+)\\))?" + "&quot;")
+		expr, err := regexp.Compile("&quot;" + regexp.QuoteMeta(name) + "( \\(([0-9]+)\\))?" + "&quot;")
+
+		if err != nil {
+			log.Err(err).Msg("overleaf import: error compiling regex, project name decoding might be faulty.")
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error compiling regex, project name decoding might be faulty.", err)
+			return
+		}
+
 		indices := expr.FindAllStringIndex(sbody, -1)
 
 		if indices == nil {
