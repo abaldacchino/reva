@@ -19,6 +19,8 @@
 package overleaf
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -36,6 +38,8 @@ import (
 	rpc "github.com/cs3org/go-cs3apis/cs3/rpc/v1beta1"
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	storagepb "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
+	typespb "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
+	"github.com/cs3org/reva/internal/http/services/datagateway"
 	"github.com/cs3org/reva/internal/http/services/reqres"
 	"github.com/cs3org/reva/pkg/appctx"
 	ctxpkg "github.com/cs3org/reva/pkg/ctx"
@@ -43,6 +47,7 @@ import (
 	"github.com/cs3org/reva/pkg/rhttp"
 	"github.com/cs3org/reva/pkg/rhttp/global"
 	"github.com/cs3org/reva/pkg/sharedconf"
+	"github.com/cs3org/reva/pkg/storage/utils/walker"
 	"github.com/cs3org/reva/pkg/utils/resourceid"
 	"github.com/go-chi/chi/v5"
 	"github.com/mitchellh/mapstructure"
@@ -145,7 +150,7 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	log := appctx.GetLogger(ctx)
 
-	statRes, err := s.validateQuery(w, r, ctx)
+	statRes, resourceRef, err := s.validateQuery(w, r, ctx)
 	if err != nil {
 		// Validate query handles errors
 		return
@@ -337,7 +342,7 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 	defer downloadRes.Body.Close()
 
-	_, err = io.ReadAll(downloadRes.Body)
+	zipFile, err := io.ReadAll(downloadRes.Body)
 	if err != nil {
 		reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: error reading Overleaf response", err)
 		return
@@ -346,6 +351,67 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 		// Overleaf server returned failure
 		reqres.WriteError(w, r, reqres.APIErrorServerError, "overleaf import: failed to make request to Overleaf server", err)
 		return
+	}
+
+	zipReader, err := zip.NewReader(bytes.NewReader(zipFile), int64(len(zipFile)))
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "unable to create zip reader:"+err.Error(), err)
+		return
+	}
+
+	for _, readFile := range zipReader.File {
+		// readFile is never a directory, but check is done just in case .File method changes
+		if !readFile.FileInfo().IsDir() {
+			unzippedFile, err := readFile.Open()
+			// Converting to []byte instead of using Reader immediately because we need to know size
+			if err != nil {
+				reqres.WriteError(w, r, reqres.APIErrorServerError, "unable to unzip file", err)
+				return
+			}
+			data, err := io.ReadAll(unzippedFile)
+			unzippedFile.Close()
+
+			fileRef := &storagepb.Reference{
+				Path: path.Join(resourceRef.Path, readFile.Name),
+			}
+
+			err = s.uploadFile(data, fileRef, w, r, ctx)
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	walker := walker.NewWalker(s.gtwClient)
+	err = walker.Walk(ctx, resourceRef.Path, func(path string, info *provider.ResourceInfo, err error) error {
+		log.Debug().Msg("Walking to " + info.Path + "...")
+		// Traverse every file/folder except for root
+		if info.Path != resourceRef.Path {
+
+			log.Debug().Msg("here")
+			_, err := zipReader.Open(info.Path[len(resourceRef.Path)+1:])
+			//defer reader.Close()
+			if err != nil {
+				log.Debug().Msg("would love to delete " + info.Path)
+				log.Debug().Msg("Deleting " + info.Path + "...")
+				ref := &storagepb.Reference{
+					Path: info.Path,
+				}
+				req := &provider.DeleteRequest{Ref: ref}
+				res, err := s.gtwClient.Delete(ctx, req)
+
+				if err != nil {
+					return err
+				} else if res.Status.Code != rpc.Code_CODE_OK {
+					return errors.New("error deleting file")
+				}
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "Unable to sync deleted files", err)
 	}
 
 	// No need to return anything, so content is empty here.
@@ -357,7 +423,7 @@ func (s *svc) handleExport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	log := appctx.GetLogger(ctx)
 
-	statRes, err := s.validateQuery(w, r, ctx)
+	statRes, _, err := s.validateQuery(w, r, ctx)
 	if err != nil {
 		// Validate query handles errors
 		return
@@ -537,10 +603,10 @@ func (s *svc) getProjectCreationTime(ctx context.Context, projectId string) (int
 	}
 }
 
-func (s *svc) validateQuery(w http.ResponseWriter, r *http.Request, ctx context.Context) (*storagepb.StatResponse, error) {
+func (s *svc) validateQuery(w http.ResponseWriter, r *http.Request, ctx context.Context) (*storagepb.StatResponse, *storagepb.Reference, error) {
 	if err := r.ParseForm(); err != nil {
 		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "parameters could not be parsed", nil)
-		return nil, err
+		return nil, nil, err
 	}
 
 	resourceID := r.Form.Get("resource_id")
@@ -550,14 +616,14 @@ func (s *svc) validateQuery(w http.ResponseWriter, r *http.Request, ctx context.
 		path := r.Form.Get("path")
 		if path == "" {
 			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "missing resource ID or path", nil)
-			return nil, errors.New("missing resource ID or path")
+			return nil, nil, errors.New("missing resource ID or path")
 		}
 		resourceRef.Path = path
 	} else {
 		resourceID := resourceid.OwnCloudResourceIDUnwrap(resourceID)
 		if resourceID == nil {
 			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "invalid resource ID", nil)
-			return nil, errors.New("invalid resource ID")
+			return nil, nil, errors.New("invalid resource ID")
 		}
 		resourceRef.ResourceId = resourceID
 	}
@@ -565,16 +631,94 @@ func (s *svc) validateQuery(w http.ResponseWriter, r *http.Request, ctx context.
 	statRes, err := s.gtwClient.Stat(ctx, &storagepb.StatRequest{Ref: &resourceRef})
 	if err != nil {
 		reqres.WriteError(w, r, reqres.APIErrorServerError, "Internal error accessing the resource, please try again later", err)
-		return nil, errors.New("Internal error accessing the resource, please try again later")
+		return nil, nil, errors.New("Internal error accessing the resource, please try again later")
 	}
 
 	if statRes.Status.Code == rpc.Code_CODE_NOT_FOUND {
 		reqres.WriteError(w, r, reqres.APIErrorNotFound, "resource does not exist", nil)
-		return nil, errors.New("resource does not exist")
+		return nil, nil, errors.New("resource does not exist")
 	} else if statRes.Status.Code != rpc.Code_CODE_OK {
 		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to stat the resource", nil)
-		return nil, errors.New("failed to stat the resource")
+		return nil, nil, errors.New("failed to stat the resource")
 	}
 
-	return statRes, nil
+	return statRes, &resourceRef, nil
+}
+
+func (s *svc) uploadFile(data []byte, fileRef *storagepb.Reference, w http.ResponseWriter, r *http.Request, ctx context.Context) error {
+	log := appctx.GetLogger(ctx)
+
+	createReq := &storagepb.InitiateFileUploadRequest{
+		Ref: fileRef,
+		Opaque: &typespb.Opaque{
+			Map: map[string]*typespb.OpaqueEntry{
+				"Upload-Length": {
+					Decoder: "plain",
+					Value:   []byte(strconv.Itoa(len(data))),
+				},
+			},
+		},
+	}
+
+	createRes, err := s.gtwClient.InitiateFileUpload(ctx, createReq)
+	if err != nil {
+		log.Err(err).Msg("error calling InitiateFileUpload")
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "error calling InitiateFileUpload", err)
+		return err
+	}
+	if createRes.Status.Code != rpc.Code_CODE_OK {
+		log.Err(err).Msg("error calling InitiateFileUpload: " + createRes.Status.Message)
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "error calling InitiateFileUpload", nil)
+		return errors.New("error calling InitiateFileUpload")
+	}
+
+	// Do a HTTP PUT with an empty body
+	var ep, uploadToken string
+	for _, p := range createRes.Protocols {
+		if p.Protocol == "simple" {
+			ep, uploadToken = p.UploadEndpoint, p.Token
+		}
+	}
+	httpReq, err := rhttp.NewRequest(ctx, http.MethodPut, ep, bytes.NewReader(data))
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to create the file", err)
+		return err
+	}
+
+	httpReq.Header.Set(datagateway.TokenTransportHeader, uploadToken)
+	httpRes, err := rhttp.GetHTTPClient(
+		rhttp.Context(ctx),
+		rhttp.Insecure(s.conf.Insecure),
+	).Do(httpReq)
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to create the file", err)
+		return err
+	}
+	defer httpRes.Body.Close()
+	if httpRes.StatusCode != http.StatusOK {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to create the file", nil)
+		return errors.New("failed to create the file")
+	}
+
+	statFileReq := &storagepb.StatRequest{
+		Ref: fileRef,
+	}
+
+	// Stat the newly created file
+	newStatRes, err := s.gtwClient.Stat(ctx, statFileReq)
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "statting the created file failed", err)
+		return err
+	}
+
+	if newStatRes.Status.Code != rpc.Code_CODE_OK {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "statting the created file failed", nil)
+		return errors.New("statting the created file failed")
+	}
+
+	if newStatRes.Info.Type != storagepb.ResourceType_RESOURCE_TYPE_FILE {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "the created resource is not a file", nil)
+		return errors.New("the created resource is not a file")
+	}
+	return nil
 }
