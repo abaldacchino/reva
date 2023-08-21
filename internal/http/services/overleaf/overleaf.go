@@ -353,16 +353,22 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 50 MB limit
+	if len(zipFile) > 1024*1024*50 {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "Project is too large to import", nil)
+		return
+	}
+
 	zipReader, err := zip.NewReader(bytes.NewReader(zipFile), int64(len(zipFile)))
 	if err != nil {
 		reqres.WriteError(w, r, reqres.APIErrorServerError, "unable to create zip reader:"+err.Error(), err)
 		return
 	}
 
-	for _, readFile := range zipReader.File {
-		// readFile is never a directory, but check is done just in case .File method changes
-		if !readFile.FileInfo().IsDir() {
-			unzippedFile, err := readFile.Open()
+	// Handle case when resource is a file
+	if resource.Type == provider.ResourceType_RESOURCE_TYPE_FILE && r.Form.Get("force_import") == "" {
+		if len(zipReader.File) == 1 {
+			unzippedFile, err := zipReader.File[0].Open()
 			// Converting to []byte instead of using Reader immediately because we need to know size
 			if err != nil {
 				reqres.WriteError(w, r, reqres.APIErrorServerError, "unable to unzip file", err)
@@ -371,47 +377,82 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 			data, err := io.ReadAll(unzippedFile)
 			unzippedFile.Close()
 
+			// Overwriting current resource
 			fileRef := &storagepb.Reference{
-				Path: path.Join(resourceRef.Path, readFile.Name),
+				Path: resourceRef.Path,
 			}
 
 			err = s.uploadFile(data, fileRef, w, r, ctx)
 			if err != nil {
 				return
 			}
+		} else {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "Multiple files detected in project when importing into a single file", nil)
+			return
 		}
-	}
+	} else { // Case when we want to upload all contents of project
+		basePath := ""
+		if resource.Type == provider.ResourceType_RESOURCE_TYPE_FILE {
+			basePath = filepath.Dir(resourceRef.Path)
+		} else {
+			basePath = resourceRef.Path
+		}
 
-	walker := walker.NewWalker(s.gtwClient)
-	err = walker.Walk(ctx, resourceRef.Path, func(path string, info *provider.ResourceInfo, err error) error {
-		log.Debug().Msg("Walking to " + info.Path + "...")
-		// Traverse every file/folder except for root
-		if info.Path != resourceRef.Path {
-
-			log.Debug().Msg("here")
-			_, err := zipReader.Open(info.Path[len(resourceRef.Path)+1:])
-			//defer reader.Close()
-			if err != nil {
-				log.Debug().Msg("would love to delete " + info.Path)
-				log.Debug().Msg("Deleting " + info.Path + "...")
-				ref := &storagepb.Reference{
-					Path: info.Path,
-				}
-				req := &provider.DeleteRequest{Ref: ref}
-				res, err := s.gtwClient.Delete(ctx, req)
-
+		for _, readFile := range zipReader.File {
+			// readFile is never a directory, but check is done just in case .File method changes
+			if !readFile.FileInfo().IsDir() {
+				unzippedFile, err := readFile.Open()
+				// Converting to []byte instead of using Reader immediately because we need to know size
 				if err != nil {
-					return err
-				} else if res.Status.Code != rpc.Code_CODE_OK {
-					return errors.New("error deleting file")
+					reqres.WriteError(w, r, reqres.APIErrorServerError, "unable to unzip file", err)
+					return
+				}
+				data, err := io.ReadAll(unzippedFile)
+				unzippedFile.Close()
+
+				fileRef := &storagepb.Reference{
+					Path: path.Join(basePath, readFile.Name),
+				}
+
+				err = s.uploadFile(data, fileRef, w, r, ctx)
+				if err != nil {
+					return
 				}
 			}
 		}
-		return nil
-	})
+	}
 
-	if err != nil {
-		reqres.WriteError(w, r, reqres.APIErrorServerError, "Unable to sync deleted files", err)
+	// Deleting extra contents only done in case that resource is a folder
+	if resource.Type == provider.ResourceType_RESOURCE_TYPE_CONTAINER {
+		walker := walker.NewWalker(s.gtwClient)
+		err = walker.Walk(ctx, resourceRef.Path, func(path string, info *provider.ResourceInfo, err error) error {
+			log.Debug().Msg("Walking to " + info.Path + "...")
+			// Traverse every file/folder except for root
+			if info.Path != resourceRef.Path {
+				_, err := zipReader.Open(info.Path[len(resourceRef.Path)+1:])
+				// defer reader.Close()		// Closing zip Reader breaks walk code
+				if err != nil {
+					log.Debug().Msg("Deleting " + info.Path + "...")
+					ref := &storagepb.Reference{
+						Path: info.Path,
+					}
+					req := &provider.DeleteRequest{Ref: ref}
+					res, err := s.gtwClient.Delete(ctx, req)
+
+					if err != nil {
+						return err
+					} else if res.Status.Code != rpc.Code_CODE_OK && res.Status.Code != rpc.Code_CODE_NOT_FOUND {
+						// Not found is not an error as we might've deleted the resource's parent folder
+						return errors.New("Error deleting file")
+					}
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			reqres.WriteError(w, r, reqres.APIErrorServerError, "Unable to sync deleted files", err)
+		}
 	}
 
 	// No need to return anything, so content is empty here.
