@@ -48,9 +48,9 @@ import (
 	"github.com/cs3org/reva/pkg/rhttp/global"
 	"github.com/cs3org/reva/pkg/sharedconf"
 	"github.com/cs3org/reva/pkg/storage/utils/walker"
+	"github.com/cs3org/reva/pkg/utils/cfg"
 	"github.com/cs3org/reva/pkg/utils/resourceid"
 	"github.com/go-chi/chi/v5"
-	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 )
 
@@ -76,8 +76,8 @@ func init() {
 }
 
 func New(ctx context.Context, m map[string]interface{}) (global.Service, error) {
-	conf := &config{}
-	if err := mapstructure.Decode(m, conf); err != nil {
+	var conf config
+	if err := cfg.Decode(m, &conf); err != nil {
 		return nil, err
 	}
 
@@ -100,7 +100,7 @@ func New(ctx context.Context, m map[string]interface{}) (global.Service, error) 
 	r := chi.NewRouter()
 
 	s := &svc{
-		conf:       conf,
+		conf:       &conf,
 		gtwClient:  gtw,
 		httpClient: httpClient,
 		router:     r,
