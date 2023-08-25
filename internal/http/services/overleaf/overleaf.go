@@ -150,9 +150,23 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	log := appctx.GetLogger(ctx)
 
-	statRes, resourceRef, err := s.validateQuery(w, r, ctx)
+	importRequest, err := getImportRequest(w, r)
+
 	if err != nil {
-		// Validate query handles errors
+		return
+	}
+
+	statRes, err := s.gtwClient.Stat(ctx, &storagepb.StatRequest{Ref: &importRequest.ResourceRef})
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "Internal error accessing the resource, please try again later", err)
+		return
+	}
+
+	if statRes.Status.Code == rpc.Code_CODE_NOT_FOUND {
+		reqres.WriteError(w, r, reqres.APIErrorNotFound, "resource does not exist", nil)
+		return
+	} else if statRes.Status.Code != rpc.Code_CODE_OK {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to stat the resource", nil)
 		return
 	}
 
@@ -366,7 +380,7 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Handle case when resource is a file
-	if resource.Type == provider.ResourceType_RESOURCE_TYPE_FILE && r.Form.Get("force_import") == "" {
+	if resource.Type == provider.ResourceType_RESOURCE_TYPE_FILE && !importRequest.ForceImport {
 		if len(zipReader.File) == 1 {
 			unzippedFile, err := zipReader.File[0].Open()
 			// Converting to []byte instead of using Reader immediately because we need to know size
@@ -379,7 +393,7 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 
 			// Overwriting current resource
 			fileRef := &storagepb.Reference{
-				Path: resourceRef.Path,
+				Path: importRequest.ResourceRef.Path,
 			}
 
 			err = s.uploadFile(data, fileRef, w, r, ctx)
@@ -393,9 +407,9 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 	} else { // Case when we want to upload all contents of project
 		basePath := ""
 		if resource.Type == provider.ResourceType_RESOURCE_TYPE_FILE {
-			basePath = filepath.Dir(resourceRef.Path)
+			basePath = filepath.Dir(importRequest.ResourceRef.Path)
 		} else {
-			basePath = resourceRef.Path
+			basePath = importRequest.ResourceRef.Path
 		}
 
 		for _, readFile := range zipReader.File {
@@ -425,11 +439,11 @@ func (s *svc) handleImport(w http.ResponseWriter, r *http.Request) {
 	// Deleting extra contents only done in case that resource is a folder
 	if resource.Type == provider.ResourceType_RESOURCE_TYPE_CONTAINER {
 		walker := walker.NewWalker(s.gtwClient)
-		err = walker.Walk(ctx, resourceRef.Path, func(path string, info *provider.ResourceInfo, err error) error {
+		err = walker.Walk(ctx, importRequest.ResourceRef.Path, func(path string, info *provider.ResourceInfo, err error) error {
 			log.Debug().Msg("Walking to " + info.Path + "...")
 			// Traverse every file/folder except for root
-			if info.Path != resourceRef.Path {
-				_, err := zipReader.Open(info.Path[len(resourceRef.Path)+1:])
+			if info.Path != importRequest.ResourceRef.Path {
+				_, err := zipReader.Open(info.Path[len(importRequest.ResourceRef.Path)+1:])
 				// defer reader.Close()		// Closing zip Reader breaks walk code
 				if err != nil {
 					log.Debug().Msg("Deleting " + info.Path + "...")
@@ -464,9 +478,23 @@ func (s *svc) handleExport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	log := appctx.GetLogger(ctx)
 
-	statRes, _, err := s.validateQuery(w, r, ctx)
+	exportRequest, err := getExportRequest(w, r)
+
 	if err != nil {
-		// Validate query handles errors
+		return
+	}
+
+	statRes, err := s.gtwClient.Stat(ctx, &storagepb.StatRequest{Ref: &exportRequest.ResourceRef})
+	if err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "Internal error accessing the resource, please try again later", err)
+		return
+	}
+
+	if statRes.Status.Code == rpc.Code_CODE_NOT_FOUND {
+		reqres.WriteError(w, r, reqres.APIErrorNotFound, "resource does not exist", nil)
+		return
+	} else if statRes.Status.Code != rpc.Code_CODE_OK {
+		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to stat the resource", nil)
 		return
 	}
 
@@ -663,48 +691,6 @@ func (s *svc) getProjectCreationTime(ctx context.Context, projectId string) (int
 	}
 }
 
-func (s *svc) validateQuery(w http.ResponseWriter, r *http.Request, ctx context.Context) (*storagepb.StatResponse, *storagepb.Reference, error) {
-	if err := r.ParseForm(); err != nil {
-		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "parameters could not be parsed", nil)
-		return nil, nil, err
-	}
-
-	resourceID := r.Form.Get("resource_id")
-
-	var resourceRef storagepb.Reference
-	if resourceID == "" {
-		path := r.Form.Get("path")
-		if path == "" {
-			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "missing resource ID or path", nil)
-			return nil, nil, errors.New("missing resource ID or path")
-		}
-		resourceRef.Path = path
-	} else {
-		resourceID := resourceid.OwnCloudResourceIDUnwrap(resourceID)
-		if resourceID == nil {
-			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "invalid resource ID", nil)
-			return nil, nil, errors.New("invalid resource ID")
-		}
-		resourceRef.ResourceId = resourceID
-	}
-
-	statRes, err := s.gtwClient.Stat(ctx, &storagepb.StatRequest{Ref: &resourceRef})
-	if err != nil {
-		reqres.WriteError(w, r, reqres.APIErrorServerError, "Internal error accessing the resource, please try again later", err)
-		return nil, nil, errors.New("Internal error accessing the resource, please try again later")
-	}
-
-	if statRes.Status.Code == rpc.Code_CODE_NOT_FOUND {
-		reqres.WriteError(w, r, reqres.APIErrorNotFound, "resource does not exist", nil)
-		return nil, nil, errors.New("resource does not exist")
-	} else if statRes.Status.Code != rpc.Code_CODE_OK {
-		reqres.WriteError(w, r, reqres.APIErrorServerError, "failed to stat the resource", nil)
-		return nil, nil, errors.New("failed to stat the resource")
-	}
-
-	return statRes, &resourceRef, nil
-}
-
 func (s *svc) uploadFile(data []byte, fileRef *storagepb.Reference, w http.ResponseWriter, r *http.Request, ctx context.Context) error {
 	log := appctx.GetLogger(ctx)
 
@@ -781,4 +767,80 @@ func (s *svc) uploadFile(data []byte, fileRef *storagepb.Reference, w http.Respo
 		return errors.New("the created resource is not a file")
 	}
 	return nil
+}
+
+func getExportRequest(w http.ResponseWriter, r *http.Request) (*exportRequest, error) {
+	if err := r.ParseForm(); err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "parameters could not be parsed", nil)
+		return nil, err
+	}
+
+	resourceID := r.Form.Get("resource_id")
+
+	var resourceRef storagepb.Reference
+	if resourceID == "" {
+		path := r.Form.Get("path")
+		if path == "" {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "missing resource ID or path", nil)
+			return nil, errors.New("missing resource ID or path")
+		}
+		resourceRef.Path = path
+	} else {
+		resourceID := resourceid.OwnCloudResourceIDUnwrap(resourceID)
+		if resourceID == nil {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "invalid resource ID", nil)
+			return nil, errors.New("invalid resource ID")
+		}
+		resourceRef.ResourceId = resourceID
+	}
+
+	// Override is true if field is set
+	override := r.Form.Get("override") != ""
+	return &exportRequest{
+		ResourceRef: resourceRef,
+		Override:    override,
+	}, nil
+}
+
+func getImportRequest(w http.ResponseWriter, r *http.Request) (*importRequest, error) {
+	if err := r.ParseForm(); err != nil {
+		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "parameters could not be parsed", nil)
+		return nil, err
+	}
+
+	resourceID := r.Form.Get("resource_id")
+
+	var resourceRef storagepb.Reference
+	if resourceID == "" {
+		path := r.Form.Get("path")
+		if path == "" {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "missing resource ID or path", nil)
+			return nil, errors.New("missing resource ID or path")
+		}
+		resourceRef.Path = path
+	} else {
+		resourceID := resourceid.OwnCloudResourceIDUnwrap(resourceID)
+		if resourceID == nil {
+			reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "invalid resource ID", nil)
+			return nil, errors.New("invalid resource ID")
+		}
+		resourceRef.ResourceId = resourceID
+	}
+
+	// Override is true if field is set
+	forceImport := r.Form.Get("force_import") != ""
+	return &importRequest{
+		ResourceRef: resourceRef,
+		ForceImport: forceImport,
+	}, nil
+}
+
+type exportRequest struct {
+	ResourceRef storagepb.Reference `json:"resourceId"`
+	Override    bool                `json:"override"`
+}
+
+type importRequest struct {
+	ResourceRef storagepb.Reference `json:"resourceId"`
+	ForceImport bool                `json:"forceImport"`
 }
